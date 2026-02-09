@@ -1,0 +1,55 @@
+[package]
+name = "ahtohallan"
+version = "0.1.0"
+authors = ["Nalinkannan <sodiumpotassium1309@gmail.com>"]
+edition = "2021"
+
+[[bin]]
+name = "backend"
+path = "src/bin/backend.rs"
+required-features = ["backend"]
+
+[dependencies]
+# Frontend - Dioxus (always included)
+dioxus = { version = "0.7.1", features = ["web"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# HTTP Client for WASM
+gloo-net = "0.6"
+
+# Backend - Axum (only for native, not WASM)
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+axum = { version = "0.7.5", features = ["multipart"] }
+tokio = { version = "1.42", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+
+# Embeddings (native only)
+fastembed = "4.2.0"
+ndarray = "0.16"
+
+# PDF parsing (native only)
+lopdf = "0.35"
+pdf-extract = "0.7"
+
+# HTTP client for Ollama (native only)
+reqwest = { version = "0.12", features = ["json"] }
+
+# Utilities (native only)
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[features]
+default = ["web"]
+web = ["dioxus/web"]
+desktop = ["dioxus/desktop"]
+mobile = ["dioxus/mobile"]
+backend = []
+
+[profile.release]
+opt-level = 'z'
+lto = true
+codegen-units = 1

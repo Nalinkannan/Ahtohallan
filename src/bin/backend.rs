@@ -18,10 +18,7 @@ use std::{
 use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn};
 
-// ============================================================================
-// DATA STRUCTURES
-// ============================================================================
-
+// Data struct
 #[derive(Clone)]
 struct AppState {
     vector_store: Arc<RwLock<VectorStore>>,
@@ -43,12 +40,25 @@ struct ChunkData {
 #[derive(Deserialize)]
 struct ChatRequest {
     query: String,
+    #[serde(default)]
+    deep_think: bool,
 }
 
 #[derive(Serialize)]
 struct ChatResponse {
     answer: String,
     sources: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct DeleteRequest {
+    filename: String,
+}
+
+#[derive(Serialize)]
+struct DeleteResponse {
+    status: String,
+    message: String,
 }
 
 #[derive(Serialize)]
@@ -76,6 +86,12 @@ impl VectorStore {
             embedding,
             source,
         });
+    }
+
+    fn remove_by_source(&mut self, source: &str) -> usize {
+        let initial_count = self.chunks.len();
+        self.chunks.retain(|chunk| chunk.source != source);
+        initial_count - self.chunks.len()
     }
 
     fn search(&self, query_embedding: &[f32], top_k: usize) -> Vec<(String, String, f32)> {
@@ -200,6 +216,36 @@ fn extract_text_from_pdf(content: &[u8]) -> Result<String, String> {
 
 async fn health_check() -> &'static str {
     "OK"
+}
+
+async fn delete_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<DeleteRequest>,
+) -> impl IntoResponse {
+    let filename = payload.filename;
+    info!("Delete request for: {}", filename);
+
+    let mut store = state.vector_store.write().unwrap();
+    let removed_count = store.remove_by_source(&filename);
+    drop(store);
+
+    if removed_count > 0 {
+        (
+            StatusCode::OK,
+            Json(DeleteResponse {
+                status: "success".to_string(),
+                message: format!("Removed {} chunks from {}", removed_count, filename),
+            }),
+        )
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(DeleteResponse {
+                status: "error".to_string(),
+                message: format!("Document {} not found", filename),
+            }),
+        )
+    }
 }
 
 async fn upload_handler(
@@ -346,7 +392,7 @@ async fn chat_handler_impl(state: AppState, payload: ChatRequest) -> Response {
         return (
             StatusCode::OK,
             Json(ChatResponse {
-                answer: "Upload documents first!".to_string(),
+                answer: "⚠️ Please upload some documents first! Use the upload section to add PDF or Markdown files.".to_string(),
                 sources: vec![],
             }),
         )
@@ -447,80 +493,131 @@ Answer:"#,
         context, query
     );
 
-    // Call Ollama
+    // Call Ollama with deep_think settings
+    let (temperature, num_ctx, timeout_secs) = if payload.deep_think {
+        (0.1, 4096, 120) // Deep think needs more time
+    } else {
+        (0.7, 2048, 60) // Quick mode
+    };
+
     let ollama_request = serde_json::json!({
         "model": "phi3",
         "prompt": prompt,
         "stream": false,
         "options": {
-            "temperature": 0.1,
+            "temperature": temperature,
+            "num_ctx": num_ctx,
             "num_predict": 512,
+            "num_gpu": 1, // Enable GPU usage
         }
     });
 
-    info!("Sending request to Ollama...");
-    match state
-        .ollama_client
-        .post("http://localhost:11434/api/generate")
-        .json(&ollama_request)
-        .timeout(Duration::from_secs(60))
-        .send()
-        .await
-    {
-        Ok(response) => {
-            info!("Received response from Ollama: {}", response.status());
-            if response.status().is_success() {
-                match response.json::<OllamaResponse>().await {
-                    Ok(ollama_resp) => {
-                        let answer = ollama_resp.response.trim().to_string();
-                        info!("Successfully generated answer: {} chars", answer.len());
-                        return (StatusCode::OK, Json(ChatResponse { answer, sources }))
-                            .into_response();
+    info!("Sending request to Ollama (timeout: {}s)...", timeout_secs);
+
+    // Retry logic for transient errors
+    let mut attempts = 0;
+    let max_attempts = 3;
+
+    loop {
+        attempts += 1;
+
+        match state
+            .ollama_client
+            .post("http://localhost:11434/api/generate")
+            .json(&ollama_request)
+            .timeout(Duration::from_secs(timeout_secs))
+            .send()
+            .await
+        {
+            Ok(response) => {
+                info!("Received response from Ollama: {}", response.status());
+                if response.status().is_success() {
+                    match response.json::<OllamaResponse>().await {
+                        Ok(ollama_resp) => {
+                            let answer = ollama_resp.response.trim().to_string();
+                            info!("Successfully generated answer: {} chars", answer.len());
+                            return (StatusCode::OK, Json(ChatResponse { answer, sources }))
+                                .into_response();
+                        }
+                        Err(e) => {
+                            error!("Failed to parse Ollama response: {}", e);
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(ChatResponse {
+                                    answer: format!("Failed to parse Ollama response: {}", e),
+                                    sources: vec![],
+                                }),
+                            )
+                                .into_response();
+                        }
                     }
-                    Err(e) => {
-                        error!("Failed to parse Ollama response: {}", e);
+                } else {
+                    let status = response.status();
+                    let error_text = response.text().await.unwrap_or_default();
+                    error!("Ollama returned error {}: {}", status, error_text);
+
+                    // Check if model is not found
+                    if error_text.contains("not found") || error_text.contains("does not exist") {
                         return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
+                            StatusCode::BAD_GATEWAY,
                             Json(ChatResponse {
-                                answer: format!("Failed to parse Ollama response: {}", e),
+                                answer: "❌ Model 'phi3' not found. Please run: `ollama pull phi3`"
+                                    .to_string(),
                                 sources: vec![],
                             }),
                         )
                             .into_response();
                     }
+
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(ChatResponse {
+                            answer: format!("Ollama error: {} - {}", status, error_text),
+                            sources: vec![],
+                        }),
+                    )
+                        .into_response();
                 }
-            } else {
-                let status = response.status();
-                let error_text = response.text().await.unwrap_or_default();
-                error!("Ollama returned error {}: {}", status, error_text);
+            }
+            Err(e) => {
+                let error_msg = e.to_string();
+                error!(
+                    "Failed to connect to Ollama (attempt {}/{}): {}",
+                    attempts, max_attempts, error_msg
+                );
+
+                // Retry on connection errors
+                if attempts < max_attempts
+                    && (error_msg.contains("connection") || error_msg.contains("timeout"))
+                {
+                    warn!("Retrying in 2 seconds...");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+
+                // Check error type for better messages
+                let user_message = if error_msg.contains("connection refused") {
+                    "❌ Cannot connect to Ollama. Please start Ollama:\n\n1. Run: `ollama serve`\n2. In another terminal: `ollama pull phi3`\n3. Try your question again"
+                } else if error_msg.contains("timeout") {
+                    "⏱️ Ollama took too long to respond. The model might be loading for the first time, or the query is too complex. Try again or use a simpler question."
+                } else {
+                    &format!("❌ Ollama connection error: {}\n\nMake sure Ollama is running with: `ollama serve`", error_msg)
+                };
+
                 return (
                     StatusCode::BAD_GATEWAY,
                     Json(ChatResponse {
-                        answer: format!("Ollama error: {} - {}", status, error_text),
+                        answer: user_message.to_string(),
                         sources: vec![],
                     }),
                 )
                     .into_response();
             }
         }
-        Err(e) => {
-            error!("Failed to connect to Ollama: {}", e);
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(ChatResponse {
-                    answer: "Start Ollama first: `ollama serve`".to_string(),
-                    sources: vec![],
-                }),
-            )
-                .into_response();
-        }
     }
 }
 
-// ============================================================================
 // MAIN
-// ============================================================================
-
 #[tokio::main]
 async fn main() {
     // Initialize tracing
@@ -539,9 +636,12 @@ async fn main() {
     .expect("Failed to load embedding model");
     info!("✅ Embedding model loaded");
 
-    // Initialize HTTP client for Ollama
+    // Initialize HTTP client for Ollama with better settings
     let ollama_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(180)) // Longer timeout for complex queries
+        .connect_timeout(Duration::from_secs(10))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .tcp_keepalive(Duration::from_secs(60))
         .build()
         .expect("Failed to create HTTP client");
 
@@ -553,10 +653,36 @@ async fn main() {
         .send()
         .await
     {
-        Ok(_) => info!("✅ Ollama is running"),
-        Err(_) => {
-            warn!("⚠️  Ollama is not running. Start it with: ollama serve");
+        Ok(response) => {
+            if response.status().is_success() {
+                info!("✅ Ollama is running");
+
+                // Check if phi3 model is available
+                if let Ok(body) = response.json::<serde_json::Value>().await {
+                    if let Some(models) = body.get("models").and_then(|m| m.as_array()) {
+                        let has_phi3 = models.iter().any(|m| {
+                            m.get("name")
+                                .and_then(|n| n.as_str())
+                                .map(|s| s.contains("phi3"))
+                                .unwrap_or(false)
+                        });
+
+                        if has_phi3 {
+                            info!("✅ Model 'phi3' is available");
+                        } else {
+                            warn!("⚠️  Model 'phi3' not found. Run: ollama pull phi3");
+                        }
+                    }
+                }
+            } else {
+                warn!("⚠️  Ollama returned status: {}", response.status());
+            }
+        }
+        Err(e) => {
+            warn!("⚠️  Ollama is not running: {}", e);
+            warn!("⚠️  Start it with: ollama serve");
             warn!("⚠️  Then run: ollama pull phi3");
+            warn!("⚠️  For GPU support, check: https://github.com/ollama/ollama/blob/main/docs/gpu.md");
         }
     }
 
@@ -572,6 +698,7 @@ async fn main() {
         .route("/health", get(health_check))
         .route("/upload", post(upload_handler))
         .route("/chat", post(chat_handler))
+        .route("/delete", post(delete_handler))
         .with_state(state)
         .layer(CorsLayer::permissive());
 
@@ -586,6 +713,7 @@ async fn main() {
     info!("   - GET  /health");
     info!("   - POST /upload (multipart/form-data)");
     info!("   - POST /chat (JSON)");
+    info!("   - POST /delete (JSON)");
 
     axum::serve(listener, app)
         .await

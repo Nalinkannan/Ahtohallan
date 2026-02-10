@@ -17,6 +17,30 @@ serde_json = "1.0"
 
 # HTTP Client for WASM
 gloo-net = "0.6"
+gloo-timers = { version = "0.3", features = ["futures"] }
+
+# WASM bindings for Web Speech API
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlInputElement",
+    "Event",
+    "SpeechSynthesis",
+    "SpeechSynthesisUtterance",
+    "Blob",
+    "BlobPropertyBag",
+    "FormData",
+    "Request",
+    "RequestInit",
+    "RequestMode",
+    "Response",
+    "Headers",
+] }
 
 # Backend - Axum (only for native, not WASM)
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

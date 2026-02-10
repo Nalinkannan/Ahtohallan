@@ -60,6 +60,8 @@ dependencies = [
  "dioxus",
  "fastembed",
  "gloo-net",
+ "gloo-timers",
+ "js-sys",
  "lopdf 0.35.0",
  "ndarray",
  "pdf-extract",
@@ -72,6 +74,9 @@ dependencies = [
  "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

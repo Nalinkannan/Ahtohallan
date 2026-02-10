@@ -39,7 +39,6 @@ fn ChatApp() -> Element {
     let mut messages = use_signal(|| Vec::<Message>::new());
     let mut input_value = use_signal(|| String::new());
     let mut is_loading = use_signal(|| false);
-    let mut deep_think = use_signal(|| false);
     let mut is_listening = use_signal(|| false);
     let mut documents = use_signal(|| Vec::<DocumentInfo>::new());
     let mut upload_status = use_signal(|| String::new());
@@ -181,9 +180,8 @@ fn ChatApp() -> Element {
             let mut messages = messages.clone();
             let mut input_value = input_value.clone();
             let mut is_loading = is_loading.clone();
-            let deep_think = deep_think.clone();
             async move {
-                send_message(messages, input_value, is_loading, deep_think).await;
+                send_message(messages, input_value, is_loading).await;
             }
         });
     };
@@ -457,13 +455,7 @@ fn ChatApp() -> Element {
                                 div {
                                     class: "message-content",
                                     strong { "🤖 Assistant: " }
-                                    span {
-                                        if deep_think() {
-                                            "🧠 Thinking deeply..."
-                                        } else {
-                                            "⚡ Quick answer..."
-                                        }
-                                    }
+                                    span { "💭 Thinking..." }
                                 }
                             }
                         }
@@ -501,16 +493,6 @@ fn ChatApp() -> Element {
 
                         div {
                             class: "controls-row",
-                            label {
-                                class: "deep-think-toggle",
-                                input {
-                                    r#type: "checkbox",
-                                    checked: deep_think(),
-                                    onchange: move |evt| deep_think.set(evt.checked()),
-                                }
-                                span { "🧠 Deep Think Mode" }
-                            }
-
                             button {
                                 class: "send-button",
                                 disabled: is_loading() || input_value().trim().is_empty() || is_listening(),
@@ -540,7 +522,6 @@ async fn send_message(
     mut messages: Signal<Vec<Message>>,
     mut input_value: Signal<String>,
     mut is_loading: Signal<bool>,
-    deep_think: Signal<bool>,
 ) {
     let query = input_value().trim().to_string();
     if query.is_empty() {
@@ -561,7 +542,7 @@ async fn send_message(
     match Request::post("http://localhost:3000/chat")
         .json(&json!({
             "query": query,
-            "deep_think": deep_think()
+            "deep_think": false
         }))
         .unwrap()
         .send()

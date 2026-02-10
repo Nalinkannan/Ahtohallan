@@ -71,6 +71,12 @@ struct OllamaResponse {
     response: String,
 }
 
+#[derive(Deserialize)]
+struct OllamaStreamResponse {
+    response: String,
+    done: bool,
+}
+
 // ============================================================================
 // VECTOR STORE IMPLEMENTATION
 // ============================================================================
@@ -211,6 +217,26 @@ fn extract_text_from_pdf(content: &[u8]) -> Result<String, String> {
 }
 
 // ============================================================================
+// HELPERS
+// ============================================================================
+
+async fn warm_up_ollama(client: &reqwest::Client) {
+    info!("🔥 Warming up Ollama connection...");
+    let _ = client
+        .post("http://localhost:11434/api/generate")
+        .json(&serde_json::json!({
+            "model": "phi3",
+            "prompt": "Hi",
+            "stream": false,
+            "options": {"num_predict": 1}
+        }))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await;
+    info!("✅ Ollama warm-up complete");
+}
+
+// ============================================================================
 // HANDLERS
 // ============================================================================
 
@@ -300,8 +326,8 @@ async fn upload_handler(
 
         info!("Extracted {} characters from {}", text.len(), filename);
 
-        // Chunk text (512 tokens ~= 512 words with 50 word overlap)
-        let chunks = chunk_text(&text, 512, 50);
+        // Chunk text (256 words with 50 word overlap for better retrieval precision)
+        let chunks = chunk_text(&text, 256, 50);
         info!("Created {} chunks from {}", chunks.len(), filename);
 
         // Generate embeddings and store
@@ -438,11 +464,11 @@ async fn chat_handler_impl(state: AppState, payload: ChatRequest) -> Response {
         }
     };
 
-    // Search vector store
+    // Search vector store (increased top-k for better coverage)
     info!("Searching vector store...");
     let results = {
         let store = state.vector_store.read().unwrap();
-        store.search(&query_embedding, 3)
+        store.search(&query_embedding, 5)
     };
     info!("Found {} results", results.len());
 
@@ -457,15 +483,37 @@ async fn chat_handler_impl(state: AppState, payload: ChatRequest) -> Response {
             .into_response();
     }
 
-    // Build context from top results
+    // Build context from top results with aggressive truncation
+    const MAX_CHUNK_WORDS: usize = 150; // Limit per chunk
+    const MAX_TOTAL_CONTEXT_WORDS: usize = 500; // Total budget
+
+    fn truncate_text(text: &str, max_words: usize) -> String {
+        let words: Vec<&str> = text.split_whitespace().take(max_words).collect();
+        words.join(" ")
+    }
+
+    let mut total_words = 0;
     let context: String = results
         .iter()
         .enumerate()
-        .map(|(i, (text, _source, score))| {
-            format!("[Chunk {}] (relevance: {:.2})\n{}\n", i + 1, score, text)
+        .filter_map(|(i, (text, _source, score))| {
+            if total_words >= MAX_TOTAL_CONTEXT_WORDS {
+                return None;
+            }
+            let truncated = truncate_text(text, MAX_CHUNK_WORDS);
+            let words_count = truncated.split_whitespace().count();
+            total_words += words_count;
+
+            Some(format!("[{}] (score: {:.2})\n{}", i + 1, score, truncated))
         })
         .collect::<Vec<_>>()
-        .join("\n---\n\n");
+        .join("\n\n");
+
+    info!(
+        "Context built with {} words from {} chunks",
+        total_words,
+        results.len()
+    );
 
     let sources: Vec<String> = results
         .iter()
@@ -474,15 +522,9 @@ async fn chat_handler_impl(state: AppState, payload: ChatRequest) -> Response {
         .into_iter()
         .collect();
 
-    // Build prompt with strict grounding
+    // Build prompt with strict grounding (simplified for faster processing)
     let prompt = format!(
-        r#"You are a helpful assistant that answers questions based ONLY on the provided context.
-
-CRITICAL RULES:
-1. Answer ONLY using information from the context below
-2. If the answer is not in the context, respond EXACTLY with: "I don't know based on the provided documents."
-3. Do not use external knowledge or make assumptions
-4. Be concise and direct
+        r#"Answer using ONLY this context. If not found, say "I don't know based on the provided documents."
 
 Context:
 {}
@@ -493,11 +535,11 @@ Answer:"#,
         context, query
     );
 
-    // Call Ollama with deep_think settings
-    let (temperature, num_ctx, timeout_secs) = if payload.deep_think {
-        (0.1, 4096, 120) // Deep think needs more time
+    // Call Ollama with optimized settings for faster responses
+    let (temperature, num_ctx, num_predict, timeout_secs) = if payload.deep_think {
+        (0.1, 2048, 384, 120) // Deep think: reduced context window, moderate generation
     } else {
-        (0.7, 2048, 60) // Quick mode
+        (0.7, 1024, 192, 60) // Quick mode: small context window, concise answers
     };
 
     let ollama_request = serde_json::json!({
@@ -507,8 +549,8 @@ Answer:"#,
         "options": {
             "temperature": temperature,
             "num_ctx": num_ctx,
-            "num_predict": 512,
-            "num_gpu": 1, // Enable GPU usage
+            "num_predict": num_predict,  // Optimized: 192-384 instead of 512
+            "num_gpu": 1, // Enable GPU usage if available
         }
     });
 
@@ -685,6 +727,9 @@ async fn main() {
             warn!("⚠️  For GPU support, check: https://github.com/ollama/ollama/blob/main/docs/gpu.md");
         }
     }
+
+    // Warm up Ollama connection to avoid cold-start latency
+    warm_up_ollama(&ollama_client).await;
 
     // Create app state
     let state = AppState {
